@@ -1,0 +1,88 @@
+#!/usr/bin/python3
+import os
+import sys
+import subprocess
+
+VERIFY_HDR = "#==[ Verification ]=================================#\n"
+COMMAND_HDR = "#==[ Command ]======================================#\n"
+CFG_HDR = "#==[ Configuration File ]===========================#\n"
+LOG_HDR = "#==[ Log File ]=====================================#\n"
+NOTE_HDR = "#==[ Note ]=========================================#\n"
+SUMMARY_HDR = "#==[ Summary ]======================================#\n"
+ENTRY_HDR = "#==[ Entry ]========================================#\n"
+
+try:
+    import lib389
+except:
+    pass
+
+def run_cmd(cmd, check):
+    output = subprocess.run(
+        cmd,
+        check=check,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    return output.stdout.decode('UTF-8')
+
+def log_cmd(logfile, cmd, check=True):
+    logfile.write(COMMAND_HDR)
+    logfile.write("%s\n" % " ".join(cmd))
+    status = True
+    try:
+        output = run_cmd(cmd, check)
+        logfile.write(output)
+    except Exception as e:
+        logfile.write("ERROR: subprocess raised error: %s\n" % e.returncode)
+        if e.stdout is not None:
+            logfile.write(e.stdout.decode('UTF-8'))
+        if e.stderr is not None:
+            logfile.write(e.stderr.decode('UTF-8'))
+        status = False
+    logfile.write("\n")
+    return status
+
+def log_note(logfile, msg):
+    logfile.write(NOTE_HDR)
+    logfile.write("%s\n" % msg)
+    logfile.write("\n")
+
+def rpm_verify(logfile):
+    if not log_cmd(logfile, ["rpm", "-q", "lib389"]):
+        sys.exit(0)
+    if not log_cmd(logfile, ["rpm", "-q", "389-ds"]):
+        sys.exit(0)
+    # If there are changes this gives a 1 returncode, but we don't care.
+    log_cmd(logfile, ["rpm", "-V", "389-ds"], check=False)
+    log_cmd(logfile, ["rpm", "-V", "lib389"], check=False)
+    log_cmd(logfile, ["rpm", "-V", "libsvrcore0"], check=False)
+
+def container_check(logfile):
+    container = os.path.exists(lib389._constants.DSRC_CONTAINER)
+    log_note(logfile, "389-ds in container: %s" % container)
+    return container
+
+def service_check(logfile, container):
+    # If container don't check.
+    pass
+
+def do_supportconfig():
+    # Get our logfile name
+    logfilename = os.path.join(os.environ['LOG'], 'dirsrv.txt')
+    # Start to write some stuff out.
+    with open(logfilename, 'w') as logfile:
+        # Do the rpm verification to proceed
+        rpm_verify(logfile)
+        # We know that we can proceed now with lib389, because it imported correctly.
+
+        # Service status
+        container = container_check(logfile)
+        service_check(logfile, container)
+
+        # Check other bits
+
+
+if __name__ == "__main__":
+    do_supportconfig()
+
+
