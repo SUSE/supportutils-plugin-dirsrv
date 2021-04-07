@@ -2,6 +2,8 @@
 import os
 import sys
 import subprocess
+import base64
+from ldif import LDIFParser
 
 VERIFY_HDR = "#==[ Verification ]=================================#\n"
 COMMAND_HDR = "#==[ Command ]======================================#\n"
@@ -10,11 +12,35 @@ LOG_HDR = "#==[ Log File ]=====================================#\n"
 NOTE_HDR = "#==[ Note ]=========================================#\n"
 SUMMARY_HDR = "#==[ Summary ]======================================#\n"
 ENTRY_HDR = "#==[ Entry ]========================================#\n"
+ERROR_HDR = "#==[ ERROR ]========================================#\n"
 
 try:
     import lib389
 except:
     pass
+
+BINARY_ATTR = ['nsstate', 'nsds7dirsynccookie']
+REDACT_ATTR = ['nsslapd-rootpw', 'nsds5replicacredentials', 'nssymmetrickey']
+YOLO = True
+
+class SimpleParser(LDIFParser):
+    def __init__(self, logfile, ldif_f):
+        self.logfile = logfile
+        super().__init__(ldif_f)
+
+    def handle(self, dn, entry):
+        # write out the entry, making sure it's sanitised
+        self.logfile.write(f"dn: {dn}\n")
+        for k,v in entry.items():
+            for va in v:
+                if k.lower() in REDACT_ATTR:
+                    self.logfile.write(f"{k}: -- REDACTED --\n")
+                elif k.lower() in BINARY_ATTR:
+                    self.logfile.write(f"{k}: {base64.b64encode(va)}\n")
+                else:
+                    self.logfile.write(f"{k}: {va.decode('UTF-8')}\n")
+        self.logfile.write("\n")
+
 
 def run_cmd(cmd, check):
     output = subprocess.run(
@@ -42,15 +68,61 @@ def log_cmd(logfile, cmd, check=True):
     logfile.write("\n")
     return status
 
-def log_note(logfile, msg):
+def log_note(logfile, msgs):
     logfile.write(NOTE_HDR)
+    for msg in msgs:
+        logfile.write("%s\n" % msg)
+    logfile.write("\n")
+
+def log_error(logfile, msg):
+    logfile.write(ERROR_HDR)
     logfile.write("%s\n" % msg)
     logfile.write("\n")
+
+def log_config(logfile, msgs):
+    logfile.write(CFG_HDR)
+    for msg in msgs:
+        logfile.write("%s\n" % msg)
+    logfile.write("\n")
+
+def dump_log_config(logfile, path):
+    if os.path.exists(path):
+        with open(path, 'r') as cnf_f:
+            log_config(logfile, [f"config -> {path} :"] + [x.replace('\n', '') for x in cnf_f.readlines()])
+    else:
+        log_error(logfile, f"No such configfile: {path}")
+
+def dump_log_ldif(logfile, ldifpath):
+    if os.path.exists(ldifpath):
+        logfile.write(CFG_HDR)
+        logfile.write(f"ldif -> {ldifpath} :\n")
+        with open(ldifpath, 'r') as lf:
+            sp = SimpleParser(logfile, lf)
+            try:
+                sp.parse()
+            except EOFError:
+                # Generally this means empty values in the entry.
+                pass
+        logfile.write("\n")
+    else:
+        log_error(logfile, f"No such ldiffile: {ldifpath}")
+
+def dump_logpath(outpath, logpath):
+    with open(outpath, 'w') as logfile:
+        logfile.write(LOG_HDR)
+        logfile.write(f"{logpath}\n\n")
+        try:
+            with open(logpath, 'r') as infile:
+                for l in infile:
+                    logfile.write(l)
+        except:
+            logfile.write(ERROR_HDR)
+            logfile.write(f"Unable to access {logpath}\n\n")
 
 def rpm_verify(logfile):
     if not log_cmd(logfile, ["rpm", "-q", "lib389"]):
         sys.exit(0)
-    if not log_cmd(logfile, ["rpm", "-q", "389-ds"]):
+    if (not log_cmd(logfile, ["rpm", "-q", "389-ds"])) and not YOLO:
         sys.exit(0)
     # If there are changes this gives a 1 returncode, but we don't care.
     log_cmd(logfile, ["rpm", "-V", "389-ds"], check=False)
@@ -59,12 +131,129 @@ def rpm_verify(logfile):
 
 def container_check(logfile):
     container = os.path.exists(lib389._constants.DSRC_CONTAINER)
-    log_note(logfile, "389-ds in container: %s" % container)
+    log_note(logfile, [f"389-ds in container: {container}"])
     return container
 
-def service_check(logfile, container):
-    # If container don't check.
-    pass
+def service_check(logfile, inst_name):
+    log_cmd(logfile, ["systemctl", "status", f"dirsrv@{inst_name}"], check=False)
+    log_cmd(logfile, ["ls", "-alhH", f"/etc/systemd/system/dirsrv@{inst_name}.service.d"], check=False)
+    try:
+        # Can we display the content of this dir?
+        for cnf in os.listdir(f"/etc/systemd/system/dirsrv@{inst_name}.service.d"):
+            p = os.path.join(f"/etc/systemd/system/dirsrv@{inst_name}.service.d", cnf)
+            dump_log_config(p)
+    except:
+        # Probably no overrides.
+        pass
+
+def instance_paths(logfile, inst):
+    locs = {}
+    for p in lib389.paths.MUST:
+        locs[p] = inst.ds_paths.__getattr__(p)
+    log_note(logfile, [f"DS Paths - {inst.serverid}:"] + [ f"{k}: {v}" for (k, v) in locs.items()])
+
+def tls_cert_configuration(logfile, inst):
+    log_cmd(logfile, ["certutil", "-L", "-d", inst.ds_paths.cert_dir])
+    tls = lib389.nss_ssl.NssSsl(dirsrv=inst)
+    log_note(logfile, ["Trusted CA Certificates:"] + [x[0] for x in tls.list_ca_certs()])
+    log_note(logfile, ["Trusted Client CA Certificates:"] + [x[0] for x in tls.list_client_ca_certs()])
+
+    for ca_name in [x[0] for x in tls.list_ca_certs()]:
+        try:
+            log_note(logfile, [f"Trusted CA Certificate Detail - {ca_name}:"] + [tls.display_cert_details(ca_name)])
+        except:
+            log_error(logfile, f"Unable to display detailed CA certificate information - {ca_name}")
+
+    for ca_name in [x[0] for x in tls.list_client_ca_certs()]:
+        try:
+            log_note(logfile, [f"Trusted Client CA Certificate Detail - {ca_name}:"] + [tls.display_cert_details(ca_name)])
+        except:
+            log_error(logfile, f"Unable to display detailed Client CA certificate information - {ca_name}")
+
+    try:
+        log_note(logfile, ["Active Server-Cert:"] + [tls.display_cert_details(lib389.nss_ssl.CERT_NAME)])
+    except:
+        log_error(logfile, "Unable to display active Server-Cert information - using alternate nickname?")
+
+def per_instance_checks(logfile, inst_name):
+    from lib389 import DirSrv
+    inst = DirSrv(verbose=True)
+    inst.local_simple_allocate(inst_name)
+    inst.setup_ldapi()
+
+    isopen = False
+    # Attempt to go online
+    # Try to open?
+    try:
+        inst.open()
+        isopen = True
+        log_note(logfile, ["✅ Connected to instance over LDAPI"])
+    except:
+        log_error(logfile, "🚨 Unable to access ldapi socket as cn=Directory Manager. Some checks may not be run ...")
+
+    # Print out our paths.
+    instance_paths(logfile, inst)
+
+    # Show the state of the config dir.
+    log_cmd(logfile, ["ls", "-alhH", inst.ds_paths.config_dir])
+
+    # Do other bits online?
+
+    # Healthcheck?
+    log_cmd(logfile, ["dsctl", inst_name, "healthcheck"], check=False)
+
+    # List cert store?
+    tls_cert_configuration(logfile, inst)
+
+    # Dump the schema.
+    if os.path.exists(inst.ds_paths.schema_dir):
+        log_cmd(logfile, ["ls", "-alhH", inst.ds_paths.schema_dir], check=False)
+        for sldif in os.listdir(inst.ds_paths.schema_dir):
+            dump_log_ldif(logfile, os.path.join(inst.ds_paths.schema_dir, sldif))
+    else:
+        log_error(logfile, f"Unable to access schema directory: {inst.ds_paths.schema_dir}")
+
+    # Dump the config, filter known security sensitive attrs.
+    dump_log_ldif(logfile, os.path.join(inst.ds_paths.config_dir, 'dse.ldif'))
+
+    # Add the access log, error log.
+    access_path = os.path.join(inst.ds_paths.log_dir, "access")
+    error_path = os.path.join(inst.ds_paths.log_dir, "errors")
+
+    if isopen:
+        access_path = inst.config.get_attr_val_utf8("nsslapd-accesslog")
+        error_path = inst.config.get_attr_val_utf8("nsslapd-errorlog")
+
+    accessfilename = os.path.join(os.environ['LOG'], f'dirsrv-slapd-{inst_name}-access-log.txt')
+    dump_logpath(accessfilename, access_path)
+
+    errorfilename = os.path.join(os.environ['LOG'], f'dirsrv-slapd-{inst_name}-error-log.txt')
+    dump_logpath(errorfilename, error_path)
+
+def get_instance_list(logfile):
+    insts = lib389.utils.get_instance_list()
+    log_note(logfile, ["Instance List:"] + insts)
+    return [ x.replace("slapd-", '', 1) for x in insts ]
+
+def run_instance_checks(logfile):
+    container = container_check(logfile)
+    insts = get_instance_list(logfile)
+
+    if container:
+        logfilename = os.path.join(os.environ['LOG'], 'dirsrv-slapd-localhost.txt')
+        # Start to write some stuff out.
+        with open(logfilename, 'w') as logfile:
+            dump_log_config(logfile, "/data/config/container.inf")
+            per_instance_checks(logfile, "localhost")
+    else:
+        # Get all the instances.
+        for inst_name in insts:
+            logfilename = os.path.join(os.environ['LOG'], f'dirsrv-slapd-{inst_name}.txt')
+            # Start to write some stuff out.
+            with open(logfilename, 'w') as logfile:
+                service_check(logfile, inst_name)
+                per_instance_checks(logfile, inst_name)
+
 
 def do_supportconfig():
     # Get our logfile name
@@ -73,13 +262,11 @@ def do_supportconfig():
     with open(logfilename, 'w') as logfile:
         # Do the rpm verification to proceed
         rpm_verify(logfile)
+        # Display all .dsrc files from root home or container if present.
+        dump_log_config(logfile, "/root/.dsrc")
         # We know that we can proceed now with lib389, because it imported correctly.
+        run_instance_checks(logfile)
 
-        # Service status
-        container = container_check(logfile)
-        service_check(logfile, container)
-
-        # Check other bits
 
 
 if __name__ == "__main__":
