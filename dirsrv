@@ -139,12 +139,13 @@ def service_check(logfile, inst_name):
     log_cmd(logfile, ["ls", "-alhH", f"/etc/systemd/system/dirsrv@{inst_name}.service.d"], check=False)
     try:
         # Can we display the content of this dir?
-        for cnf in os.listdir(f"/etc/systemd/system/dirsrv@{inst_name}.service.d"):
-            p = os.path.join(f"/etc/systemd/system/dirsrv@{inst_name}.service.d", cnf)
-            dump_log_config(p)
-    except:
+        if os.path.exists(f"/etc/systemd/system/dirsrv@{inst_name}.service.d"):
+            for cnf in os.listdir(f"/etc/systemd/system/dirsrv@{inst_name}.service.d"):
+                p = os.path.join(f"/etc/systemd/system/dirsrv@{inst_name}.service.d", cnf)
+                dump_log_config(logfile, p)
+    except Exception as e:
         # Probably no overrides.
-        pass
+        log_error(logfile, e)
 
 def instance_paths(logfile, inst):
     locs = {}
