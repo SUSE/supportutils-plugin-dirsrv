@@ -173,6 +173,7 @@ def tls_cert_configuration(logfile, inst):
 
     try:
         log_note(logfile, ["Active Server-Cert:"] + [tls.display_cert_details(lib389.nss_ssl.CERT_NAME)])
+        log_cmd(logfile, ["certutil", "-V", "-d", inst.ds_paths.cert_dir, "-n", lib389.nss_ssl.CERT_NAME, "-u", "V"])
     except:
         log_error(logfile, "Unable to display active Server-Cert information - using alternate nickname?")
 
