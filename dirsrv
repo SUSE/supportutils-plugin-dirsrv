@@ -42,21 +42,26 @@ class SimpleParser(LDIFParser):
         self.logfile.write("\n")
 
 
-def run_cmd(cmd, check):
+def run_cmd(cmd, check, shell=False):
     output = subprocess.run(
         cmd,
         check=check,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
+        shell=shell
     )
     return output.stdout.decode('UTF-8')
 
-def log_cmd(logfile, cmd, check=True):
+def log_cmd(logfile, cmd, check=True, shell=False):
     logfile.write(COMMAND_HDR)
     logfile.write("%s\n" % " ".join(cmd))
     status = True
     try:
-        output = run_cmd(cmd, check)
+        if shell:
+            cmd = " ".join(cmd)
+            output = run_cmd(cmd, check, shell)
+        else:
+            output = run_cmd(cmd, check, shell)
         logfile.write(output)
     except Exception as e:
         logfile.write("ERROR: subprocess raised error: %s\n" % e.returncode)
@@ -174,6 +179,7 @@ def tls_cert_configuration(logfile, inst):
     try:
         log_note(logfile, ["Active Server-Cert:"] + [tls.display_cert_details(lib389.nss_ssl.CERT_NAME)])
         log_cmd(logfile, ["certutil", "-V", "-d", inst.ds_paths.cert_dir, "-n", lib389.nss_ssl.CERT_NAME, "-u", "V"])
+        log_cmd(logfile, ["certutil", "-L", "-d", inst.ds_paths.cert_dir, "-n", lib389.nss_ssl.CERT_NAME, "-a", "|", "openssl", "x509", "-noout", "-purpose"], shell=True)
     except:
         log_error(logfile, "Unable to display active Server-Cert information - using alternate nickname?")
 
